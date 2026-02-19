@@ -29,16 +29,18 @@ test: all
 	@echo "--- Starting Test ---"
 	@echo "1. Creating test file 'input.txt'..."
 	@echo "Hello World from a clean test! 123." > input.txt
+	@cat input.txt
 
 	@echo "2. Encrypting 'input.txt' -> 'encrypted.bin'..."
 	$(LOADER) ./$(LIB_NAME) 42 input.txt encrypted.bin
 
 	@echo "3. Decrypting 'encrypted.bin' -> 'decrypted.txt'..."
 	$(LOADER) ./$(LIB_NAME) 42 encrypted.bin decrypted.txt
+	@cat decrypted.txt
 
 	@echo "4. Verifying correctness..."
-	@diff -q input.txt decrypted.txt && echo "✅ TEST PASSED!" || (echo "❌ TEST FAILED!" && exit 1)
-	@echo "--- Test Complete ---"
+	@cmp input.txt decrypted.txt && echo "✅ TEST PASSED!" || (echo "Files input.txt and decrypted.txt differ" && echo "❌ TEST FAILED!" && exit 1)
+
 
 # Копирует библиотеку в системную директорию (только для Linux)
 install: all

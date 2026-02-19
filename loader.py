@@ -4,11 +4,9 @@ import sys
 import ctypes
 import os
 
-
 def main():
     if len(sys.argv) != 5:
-        print(
-            f"Usage: {sys.argv[0]} <lib_path> <key> <input_file> <output_file>")
+        print(f"Usage: {sys.argv[0]} <lib_path> <key> <input_file> <output_file>")
         sys.exit(1)
 
     lib_path = sys.argv[1]
@@ -49,22 +47,24 @@ def main():
         print(f"Error: Input file not found: '{input_file}'")
         sys.exit(1)
 
-    # Создание изменяемого буфера из данных файла
-    buffer = ctypes.create_string_buffer(file_data)
+    # Создание двух буферов: источник и назначение
+    src_buffer = ctypes.create_string_buffer(file_data)
+    dst_buffer = ctypes.create_string_buffer(file_data)  # Выделяем буфер нужного размера
 
     # Установка ключа шифрования
     lib.set_key(key)
 
-    # Выполнение XOR-операции прямо в буфере
-    lib.caesar(buffer, buffer, len(file_data))
+    # Выполнение XOR-операции: src → dst (отдельные буферы)
+    lib.caesar(src_buffer, dst_buffer, len(file_data))
 
-    # Запись измененного буфера в выходной файл
+    # Запись результата из dst_buffer в выходной файл
     with open(output_file, 'wb') as f:
-        f.write(buffer.raw)
+        f.write(dst_buffer.raw)
+        
+    with open(output_file, 'wb') as f:
+        f.write(dst_buffer.raw[:len(file_data)]) 
 
-    print(
-        f"Success: Processed '{input_file}' -> '{output_file}' with key {key}.")
-
+    print(f"Success: Processed '{input_file}' -> '{output_file}' with key {key}.")
 
 if __name__ == "__main__":
     main()
