@@ -6,6 +6,12 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+#ifdef _WIN32
+    #include <direct.h>
+#else
+    #include <sys/types.h>
+#endif
+
 #include "caesar.h"
 
 #define BUFFER_SIZE 4096
@@ -55,8 +61,13 @@ void process_file(const char* input_name)
         return;
     }
 
+    const char* filename = input_name;
+    for (const char* p = input_name; *p; p++)
+        if (*p == '/' || *p == '\\')
+            filename = p + 1;
+
     char output_path[512];
-    snprintf(output_path, sizeof(output_path), "%s/%s", output_dir, input_name);
+    snprintf(output_path, sizeof(output_path), "%s/%s", output_dir, filename);
 
     FILE* out = fopen(output_path, "wb");
     if (!out)
@@ -92,7 +103,7 @@ void process_file(const char* input_name)
     copied_count++;
     pthread_mutex_unlock(&global_mutex);
 
-    printf("Файл обработан: %s (%.2f сек)\n", input_name, time_spent);
+    printf("File processed: %s (%.2f sec)\n", input_name, time_spent);
 }
 
 
@@ -110,7 +121,7 @@ void* worker_thread(void* arg)
 
         if (res == ETIMEDOUT)
         {
-            printf("⚠ Возможная взаимоблокировка: поток ждет >5 сек\n");
+            printf("WARNING: Possible deadlock: thread waiting >5 sec\n");
             continue;
         }
 
@@ -148,7 +159,7 @@ int main(int argc, char* argv[])
     set_key((char)key);
 
     #ifdef _WIN32
-        mkdir(output_dir);
+        _mkdir(output_dir);
     #else
         mkdir(output_dir, 0777);
     #endif
@@ -161,7 +172,7 @@ int main(int argc, char* argv[])
     for (int i = 0; i < THREAD_COUNT; i++)
         pthread_join(threads[i], NULL);
 
-    printf("Всего обработано файлов: %d\n", copied_count);
+    printf("Total files processed: %d\n", copied_count);
 
     return 0;
 }
