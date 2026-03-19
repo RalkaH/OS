@@ -1,4 +1,4 @@
-# Задание 2. Простой файловый копировщик с шифрованием
+# Задание 3. Многопоточный файловый копировщик с шифрованием
 
 ## Сборка
 
@@ -10,14 +10,16 @@ mingw32-make
 
 ## Запуск
 
-./secure_copy input.txt output.bin 42
+./secure_copy_mt file1.txt file2.txt file3.txt output_dir 42
 
-## Тесты
+## Особенности
 
-Run automatic test:
+- Многопоточная обработка (3 потока)
+- Шифрование (XOR / Caesar)
+- Защита общих ресурсов с помощью mutex
+- Обнаружение возможных deadlock (timedlock)
+- Логирование в файл log.txt
 
-make test
+## Тест
 
-Run 10MB file test:
-
-make bigtest
+make run
