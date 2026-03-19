@@ -4,9 +4,11 @@ import sys
 import ctypes
 import os
 
+
 def main():
     if len(sys.argv) != 5:
-        print(f"Usage: {sys.argv[0]} <lib_path> <key> <input_file> <output_file>")
+        print(
+            f"Usage: {sys.argv[0]} <lib_path> <key> <input_file> <output_file>")
         sys.exit(1)
 
     lib_path = sys.argv[1]
@@ -49,7 +51,8 @@ def main():
 
     # Создание двух буферов: источник и назначение
     src_buffer = ctypes.create_string_buffer(file_data)
-    dst_buffer = ctypes.create_string_buffer(file_data)  # Выделяем буфер нужного размера
+    dst_buffer = ctypes.create_string_buffer(
+        file_data)  # Выделяем буфер нужного размера
 
     # Установка ключа шифрования
     lib.set_key(key)
@@ -60,11 +63,13 @@ def main():
     # Запись результата из dst_buffer в выходной файл
     with open(output_file, 'wb') as f:
         f.write(dst_buffer.raw)
-        
-    with open(output_file, 'wb') as f:
-        f.write(dst_buffer.raw[:len(file_data)]) 
 
-    print(f"Success: Processed '{input_file}' -> '{output_file}' with key {key}.")
+    with open(output_file, 'wb') as f:
+        f.write(dst_buffer.raw[:len(file_data)])
+
+    print(
+        f"Success: Processed '{input_file}' -> '{output_file}' with key {key}.")
+
 
 if __name__ == "__main__":
     main()

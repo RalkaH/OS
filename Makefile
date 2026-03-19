@@ -1,56 +1,59 @@
-# Определяем ОС и настраиваем переменные
 UNAME_S := $(shell uname -s)
 
-LIB_PREFIX = lib
-LIB_EXT = .so
-INSTALL_CMD = sudo cp
-# По умолчанию для Linux
+CC=gcc
+CXX=g++
 
-# Переопределяем для Windows (в среде MINGW/Git Bash)
+CFLAGS=-Wall -pthread
+CXXFLAGS=-Wall -fPIC
+
+LIB_NAME=libcaesar
+
 ifeq ($(findstring MINGW,$(UNAME_S)),MINGW)
-    LIB_EXT = .dll
-    INSTALL_CMD = echo "Install target is not applicable on Windows."
+    LIB_EXT=dll
+else
+    LIB_EXT=so
 endif
 
-LIB_NAME = $(LIB_PREFIX)caesar$(LIB_EXT)
-LOADER = python3 loader.py
-CXX = g++
-CXXFLAGS = -Wall -Wextra -pedantic -fPIC
+all: $(LIB_NAME).$(LIB_EXT) secure_copy
 
-.PHONY: all test clean install
+$(LIB_NAME).$(LIB_EXT): caesar.cpp
+	$(CXX) $(CXXFLAGS) -shared caesar.cpp -o $(LIB_NAME).$(LIB_EXT)
 
-# Цель по умолчанию: собрать библиотеку
-all: $(LIB_NAME)
+secure_copy: secure_copy.c
+	$(CC) secure_copy.c -o secure_copy $(CFLAGS) -L. -lcaesar
 
-$(LIB_NAME): caesar.cpp caesar.h
-	$(CXX) $(CXXFLAGS) -shared -o $@ caesar.cpp
+
+# -----------------------------
+# Тесты
+# -----------------------------
 
 test: all
-	@echo "--- Starting Test ---"
-	@echo "1. Creating test file 'input.txt'..."
-	@echo "Hello World from a clean test! 123." > input.txt
-	@cat input.txt
+	@echo "Creating test file..."
+	@echo "Hello Operating Systems!" > input.txt
 
-	@echo "2. Encrypting 'input.txt' -> 'encrypted.bin'..."
-	$(LOADER) ./$(LIB_NAME) 42 input.txt encrypted.bin
+	@echo "Encrypting..."
+	./secure_copy input.txt encrypted.bin 42
 
-	@echo "3. Decrypting 'encrypted.bin' -> 'decrypted.txt'..."
-	$(LOADER) ./$(LIB_NAME) 42 encrypted.bin decrypted.txt
+	@echo "Decrypting..."
+	./secure_copy encrypted.bin decrypted.txt 42
+
+	@echo "Result:"
 	@cat decrypted.txt
 
-	@echo "4. Verifying correctness..."
-	@cmp input.txt decrypted.txt && echo "✅ TEST PASSED!" || (echo "Files input.txt and decrypted.txt differ" && echo "❌ TEST FAILED!" && exit 1)
+	@echo "Checking correctness..."
+	@cmp input.txt decrypted.txt && echo "TEST PASSED"
 
 
-# Копирует библиотеку в системную директорию (только для Linux)
-install: all
-	$(INSTALL_CMD) $(LIB_NAME) /usr/local/lib/
-ifeq ($(findstring MINGW,$(UNAME_S)),)
-	sudo ldconfig
-	@echo "Installation complete."
-endif
+# 10мб тест
+bigtest: all
+	@echo "Creating 10MB file..."
+	dd if=/dev/urandom of=test.bin bs=1M count=10
 
-# Очистка
+	@echo "Running secure_copy..."
+	./secure_copy test.bin enc.bin 55
+
+	@echo "Done"
+
+
 clean:
-	@echo "Cleaning up generated files..."
-	rm -f $(LIB_NAME) input.txt encrypted.bin decrypted.txt
+	rm -f secure_copy secure_copy.exe $(LIB_NAME).so $(LIB_NAME).dll *.bin *.txt

@@ -1,10 +1,5 @@
+*.exe
 *.dll
 *.so
-*.o
-
-*.exe
-
-input.txt
-output.txt
-encrypted.bin
-decrypted.txt
+*.bin
+*.txt
