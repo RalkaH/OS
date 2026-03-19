@@ -1,109 +1,209 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <signal.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#ifdef _WIN32
+    #include <direct.h>
+    #define MKDIR(path) _mkdir(path)
+#else
+    #include <sys/types.h>
+    #define MKDIR(path) mkdir(path, 0755)
+#endif
 
 #include "caesar.h"
 
 #define BUFFER_SIZE 4096
+#define THREAD_COUNT 3
 
-volatile sig_atomic_t keep_running = 1;
+char** files;
+int file_count;
+int current_index = 0;
+int copied_count = 0;
+char* output_dir;
 
-typedef struct
-{
-    unsigned char data[BUFFER_SIZE];
-    size_t size;
-    int full;
-    int done;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-
-} buffer_t;
+pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
 {
-    FILE* input;
-    buffer_t* buffer;
+    int thread_num;
+} thread_arg_t;
 
-} producer_args;
-
-typedef struct
+void create_directory(const char* path)
 {
-    FILE* output;
-    buffer_t* buffer;
+    if (!path || path[0] == '\0')
+        return;
 
-} consumer_args;
+    char temp[512];
+    snprintf(temp, sizeof(temp), "%s", path);
 
-void sigint_handler(int sig)
-{
-    keep_running = 0;
-}
+    size_t len = strlen(temp);
+    if (len == 0)
+        return;
 
-void* producer_thread(void* arg)
-{
-    producer_args* args = (producer_args*)arg;
-    buffer_t* buffer = args->buffer;
+    if (len > 1 && (temp[len - 1] == '/' || temp[len - 1] == '\\'))
+        temp[len - 1] = '\0';
 
-    unsigned char read_buf[BUFFER_SIZE];
-    unsigned char enc_buf[BUFFER_SIZE];
-
-    while (keep_running)
+    for (char* p = temp + 1; *p; p++)
     {
-        size_t bytes = fread(read_buf, 1, BUFFER_SIZE, args->input);
-
-        pthread_mutex_lock(&buffer->mutex);
-
-        while (buffer->full && keep_running)
-            pthread_cond_wait(&buffer->not_full, &buffer->mutex);
-
-        if (bytes == 0)
+        if (*p == '/' || *p == '\\')
         {
-            buffer->done = 1;
-            pthread_cond_signal(&buffer->not_empty);
-            pthread_mutex_unlock(&buffer->mutex);
-            break;
+            char old = *p;
+            *p = '\0';
+
+            if (MKDIR(temp) != 0 && errno != EEXIST)
+                perror("Failed to create directory");
+
+            *p = old;
         }
-
-        caesar(read_buf, enc_buf, bytes);
-
-        memcpy(buffer->data, enc_buf, bytes);
-        buffer->size = bytes;
-        buffer->full = 1;
-
-        pthread_cond_signal(&buffer->not_empty);
-        pthread_mutex_unlock(&buffer->mutex);
     }
 
-    return NULL;
+    if (MKDIR(temp) != 0 && errno != EEXIST)
+        perror("Failed to create directory");
 }
 
-void* consumer_thread(void* arg)
+int is_regular_file(const char* path)
 {
-    consumer_args* args = (consumer_args*)arg;
-    buffer_t* buffer = args->buffer;
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+
+#ifdef _WIN32
+    return (st.st_mode & _S_IFREG) != 0;
+#else
+    return S_ISREG(st.st_mode);
+#endif
+}
+
+void log_operation(int thread_num, const char* filename, const char* status, double time_spent)
+{
+    FILE* log = fopen("log.txt", "a");
+    if (!log)
+        return;
+
+    time_t now = time(NULL);
+    char time_str[64];
+
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    fprintf(log, "[%s] Thread %d: %s - %s (%.2f sec)\n",
+            time_str,
+            thread_num,
+            filename,
+            status,
+            time_spent);
+
+    fclose(log);
+}
+
+void process_file(const char* input_name, int thread_num)
+{
+    if (!is_regular_file(input_name))
+    {
+        pthread_mutex_lock(&global_mutex);
+        log_operation(thread_num, input_name, "SKIPPED_NOT_REGULAR_FILE", 0);
+        pthread_mutex_unlock(&global_mutex);
+        return;
+    }
+
+    FILE* in = fopen(input_name, "rb");
+    if (!in)
+    {
+        pthread_mutex_lock(&global_mutex);
+        log_operation(thread_num, input_name, "ERROR_OPEN_INPUT", 0);
+        pthread_mutex_unlock(&global_mutex);
+        return;
+    }
+
+    const char* filename = input_name;
+    for (const char* p = input_name; *p; p++)
+    {
+        if (*p == '/' || *p == '\\')
+            filename = p + 1;
+    }
+
+    char output_path[512];
+    int needed = snprintf(output_path, sizeof(output_path), "%s/%s", output_dir, filename);
+    if (needed < 0 || needed >= (int)sizeof(output_path))
+    {
+        fclose(in);
+        pthread_mutex_lock(&global_mutex);
+        log_operation(thread_num, input_name, "ERROR_PATH_TOO_LONG", 0);
+        pthread_mutex_unlock(&global_mutex);
+        return;
+    }
+
+    FILE* out = fopen(output_path, "wb");
+    if (!out)
+    {
+        fclose(in);
+
+        pthread_mutex_lock(&global_mutex);
+        log_operation(thread_num, input_name, "ERROR_OPEN_OUTPUT", 0);
+        pthread_mutex_unlock(&global_mutex);
+        return;
+    }
+
+    unsigned char buf[BUFFER_SIZE];
+    unsigned char enc[BUFFER_SIZE];
+
+    size_t bytes;
+    clock_t start = clock();
+
+    while ((bytes = fread(buf, 1, BUFFER_SIZE, in)) > 0)
+    {
+        caesar(buf, enc, (int)bytes);
+        fwrite(enc, 1, bytes, out);
+    }
+
+    fclose(in);
+    fclose(out);
+
+    clock_t end = clock();
+    double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
+
+    pthread_mutex_lock(&global_mutex);
+    copied_count++;
+    log_operation(thread_num, input_name, "SUCCESS", time_spent);
+    pthread_mutex_unlock(&global_mutex);
+
+    printf("Thread %d processed: %s (%.2f sec)\n", thread_num, input_name, time_spent);
+}
+
+void* worker_thread(void* arg)
+{
+    thread_arg_t* t = (thread_arg_t*)arg;
+    int thread_num = t->thread_num;
 
     while (1)
     {
-        pthread_mutex_lock(&buffer->mutex);
+        int index;
 
-        while (!buffer->full && !buffer->done)
-            pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
 
-        if (!buffer->full && buffer->done)
+        int res = pthread_mutex_timedlock(&global_mutex, &ts);
+
+        if (res == ETIMEDOUT)
         {
-            pthread_mutex_unlock(&buffer->mutex);
+            printf("WARNING: Possible deadlock: thread %d waiting >5 sec\n", thread_num);
+            continue;
+        }
+
+        if (current_index >= file_count)
+        {
+            pthread_mutex_unlock(&global_mutex);
             break;
         }
 
-        fwrite(buffer->data, 1, buffer->size, args->output);
+        index = current_index++;
+        pthread_mutex_unlock(&global_mutex);
 
-        buffer->full = 0;
-
-        pthread_cond_signal(&buffer->not_full);
-        pthread_mutex_unlock(&buffer->mutex);
+        process_file(files[index], thread_num);
     }
 
     return NULL;
@@ -111,66 +211,35 @@ void* consumer_thread(void* arg)
 
 int main(int argc, char* argv[])
 {
-    if (argc != 4)
+    if (argc < 4)
     {
-        printf("Usage: %s input output key\n", argv[0]);
+        printf("Usage: %s file1 file2 ... output_dir key\n", argv[0]);
         return 1;
     }
 
-    char* input_file = argv[1];
-    char* output_file = argv[2];
-    int key = atoi(argv[3]);
+    file_count = argc - 3;
+    files = &argv[1];
 
-    FILE* in = fopen(input_file, "rb");
-    if (!in)
-    {
-        perror("Input file error");
-        return 1;
-    }
-
-    FILE* out = fopen(output_file, "wb");
-    if (!out)
-    {
-        perror("Output file error");
-        fclose(in);
-        return 1;
-    }
+    output_dir = argv[argc - 2];
+    int key = atoi(argv[argc - 1]);
 
     set_key((char)key);
 
-    signal(SIGINT, sigint_handler);
+    create_directory(output_dir);
 
-    buffer_t buffer;
+    pthread_t threads[THREAD_COUNT];
+    thread_arg_t args[THREAD_COUNT];
 
-    buffer.size = 0;
-    buffer.full = 0;
-    buffer.done = 0;
+    for (int i = 0; i < THREAD_COUNT; i++)
+    {
+        args[i].thread_num = i + 1;
+        pthread_create(&threads[i], NULL, worker_thread, &args[i]);
+    }
 
-    pthread_mutex_init(&buffer.mutex, NULL);
-    pthread_cond_init(&buffer.not_full, NULL);
-    pthread_cond_init(&buffer.not_empty, NULL);
+    for (int i = 0; i < THREAD_COUNT; i++)
+        pthread_join(threads[i], NULL);
 
-    pthread_t producer;
-    pthread_t consumer;
-
-    producer_args p_args = {in, &buffer};
-    consumer_args c_args = {out, &buffer};
-
-    pthread_create(&producer, NULL, producer_thread, &p_args);
-    pthread_create(&consumer, NULL, consumer_thread, &c_args);
-
-    pthread_join(producer, NULL);
-    pthread_join(consumer, NULL);
-
-    fclose(in);
-    fclose(out);
-
-    pthread_mutex_destroy(&buffer.mutex);
-    pthread_cond_destroy(&buffer.not_full);
-    pthread_cond_destroy(&buffer.not_empty);
-
-    if (!keep_running)
-        printf("Операция прервана пользователем\n");
+    printf("Total files processed: %d\n", copied_count);
 
     return 0;
 }
