@@ -389,10 +389,8 @@ int main(int argc, char* argv[])
 {
     signal(SIGINT, sigint_handler);
 
-    /*
-        Старый режим:
-        ./secure_copy input output key
-    */
+    int test_violation = 0;
+
     if (argc == 4 &&
         strncmp(argv[1], "--mode=", 7) != 0 &&
         strncmp(argv[1], "--key=", 6) != 0)
@@ -401,10 +399,6 @@ int main(int argc, char* argv[])
         return run_old_compatibility_mode(argv[1], argv[2], key);
     }
 
-    /*
-        Новый режим:
-        ./secure_copy --mode=sequential --key=42 file1 file2 ...
-    */
     if (argc < 4)
     {
         print_usage(argv[0]);
@@ -418,7 +412,11 @@ int main(int argc, char* argv[])
 
     for (int i = 1; i < argc; i++)
     {
-        if (strncmp(argv[i], "--mode=", 7) == 0)
+        if (strcmp(argv[i], "--test-violation") == 0)
+        {
+            test_violation = 1;
+        }
+        else if (strncmp(argv[i], "--mode=", 7) == 0)
         {
             if (parse_mode(argv[i], &mode) != 0)
             {
@@ -431,10 +429,9 @@ int main(int argc, char* argv[])
             key = atoi(argv[i] + 6);
             key_set = 1;
         }
-        else
+        else if (first_input_index == -1)
         {
             first_input_index = i;
-            break;
         }
     }
 
@@ -455,12 +452,19 @@ int main(int argc, char* argv[])
 
     set_key((char)key);
 
+    if (test_violation)
+    {
+        printf(">>> Инициируем попытку несанкционированной записи в защищенную память...\n");
+        test_security_violation();
+    }
+
     if (mode == MODE_SEQUENTIAL || mode == MODE_PARALLEL)
     {
         file_task_t* tasks = create_tasks(input_files, files_count, ".enc");
         if (!tasks)
         {
             fprintf(stderr, "Memory allocation error\n");
+            cleanup_key();
             return 1;
         }
 
@@ -488,6 +492,7 @@ int main(int argc, char* argv[])
             fprintf(stderr, "Memory allocation error\n");
             free(chosen_tasks);
             free(alt_tasks);
+            cleanup_key();
             return 1;
         }
 
@@ -533,6 +538,8 @@ int main(int argc, char* argv[])
 
     if (!keep_running)
         printf("Операция прервана пользователем\n");
+
+    cleanup_key();
 
     return 0;
 }

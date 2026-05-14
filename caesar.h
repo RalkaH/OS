@@ -6,7 +6,9 @@ extern "C" {
 #endif
 
 void set_key(char key);
+void cleanup_key();
 void caesar(void* src, void* dst, int len);
+void test_security_violation();
 
 #ifdef __cplusplus
 }
