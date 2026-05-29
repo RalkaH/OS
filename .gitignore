@@ -3,3 +3,6 @@
 *.so
 *.bin
 *.txt
+*.img
+*.tmp
+*.dat

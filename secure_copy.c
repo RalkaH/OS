@@ -1,545 +1,712 @@
+/* 64-битные файловые операции — ДОЛЖНО быть до любых #include,
+   иначе off_t/fseeko останутся 32-битными на 32-битных системах */
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <signal.h>
 #include <string.h>
-#include <time.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <libgen.h>
 #include <errno.h>
 
-#include "caesar.h"
+#include "rc4.h"
 
 #define BUFFER_SIZE 4096
-#define WORKERS_COUNT 4
+#define MAX_WORKERS 5
 #define MAX_PATH_LEN 1024
-
-volatile sig_atomic_t keep_running = 1;
-
-typedef enum
-{
-    MODE_SEQUENTIAL,
-    MODE_PARALLEL,
-    MODE_AUTO
-
-} run_mode_t;
+#define MAX_NAME_LEN 1023    /* максимальная длина имени файла в образе */
 
 typedef struct
 {
-    const char* input_path;
-    char output_path[MAX_PATH_LEN];
-    double duration_ms;
-    int status;
-
+    char real_path[MAX_PATH_LEN];
+    char image_path[MAX_PATH_LEN];
+    uint32_t file_size;      // размер исходного файла (stat)
+    off_t image_offset;      // предрасчитанное смещение в образе
 } file_task_t;
 
 typedef struct
 {
     file_task_t* tasks;
     int count;
-    int next_index;
-    int started;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-
+    int capacity;
+    int next_index;          // атомарно через __atomic_fetch_add (без мьютекса)
+    char* image_name;
+    int image_fd;            // fd образа для pwrite
+    off_t original_size;     // исходный размер образа (для отката при ошибке)
 } task_queue_t;
 
 typedef struct
 {
-    task_queue_t* queue;
+    char name[MAX_PATH_LEN];
+    uint32_t size;
+} list_item_t;
 
-} worker_args_t;
 
-typedef struct
+/* ---------------------------------------------------------------
+ * Вспомогательные функции для little-endian формата образа.
+ * ТЗ: "Образ, созданный программой одного студента, должен
+ * корректно обрабатываться программой другого студента."
+ * Фиксированный LE-формат гарантирует совместимость
+ * независимо от архитектуры.
+ * --------------------------------------------------------------- */
+static void write_le32(unsigned char* buf, uint32_t val)
 {
-    run_mode_t mode;
-    double total_ms;
-    double avg_ms;
-    int processed_files;
-    int success_files;
-
-} run_stats_t;
-
-void sigint_handler(int sig)
-{
-    (void)sig;
-    keep_running = 0;
+    buf[0] = (unsigned char)(val & 0xFF);
+    buf[1] = (unsigned char)((val >> 8) & 0xFF);
+    buf[2] = (unsigned char)((val >> 16) & 0xFF);
+    buf[3] = (unsigned char)((val >> 24) & 0xFF);
 }
 
-double diff_ms(struct timespec start, struct timespec end)
+static uint32_t read_le32(const unsigned char* buf)
 {
-    double sec = (double)(end.tv_sec - start.tv_sec) * 1000.0;
-    double nsec = (double)(end.tv_nsec - start.tv_nsec) / 1000000.0;
-    return sec + nsec;
+    return (uint32_t)buf[0]
+         | ((uint32_t)buf[1] << 8)
+         | ((uint32_t)buf[2] << 16)
+         | ((uint32_t)buf[3] << 24);
 }
 
-const char* mode_to_string(run_mode_t mode)
+
+void generate_salt(unsigned char* salt)
 {
-    switch (mode)
+    FILE* urandom = fopen("/dev/urandom", "rb");
+    if (urandom)
     {
-        case MODE_SEQUENTIAL: return "sequential";
-        case MODE_PARALLEL:   return "parallel";
-        case MODE_AUTO:       return "auto";
-        default:              return "unknown";
+        if (fread(salt, 1, 16, urandom) != 16)
+        {
+            fprintf(stderr, "Ошибка: не удалось прочитать /dev/urandom\n");
+            fclose(urandom);
+            exit(1);
+        }
+        fclose(urandom);
+    }
+    else
+    {
+        fprintf(stderr, "Ошибка: /dev/urandom недоступен, невозможно сгенерировать соль\n");
+        exit(1);
     }
 }
 
-run_mode_t choose_auto_mode(int files_count)
+// Рекурсивный сбор файлов + stat() для предрасчёта размеров
+void collect_files(task_queue_t* q, const char* base_real, const char* base_image)
 {
-    return (files_count < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
+    struct stat st;
+    if (stat(base_real, &st) != 0)
+    {
+        fprintf(stderr, "Предупреждение: путь не найден: %s\n", base_real);
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode))
+    {
+        DIR* dir = opendir(base_real);
+        if (!dir) return;
+        struct dirent* entry;
+
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            char next_real[MAX_PATH_LEN];
+            char next_image[MAX_PATH_LEN];
+
+            snprintf(next_real, MAX_PATH_LEN, "%s/%s", base_real, entry->d_name);
+
+            if (strlen(base_image) == 0)
+                snprintf(next_image, MAX_PATH_LEN, "%s", entry->d_name);
+            else
+                snprintf(next_image, MAX_PATH_LEN, "%s/%s", base_image, entry->d_name);
+
+            collect_files(q, next_real, next_image);
+        }
+        closedir(dir);
+    }
+    else if (S_ISREG(st.st_mode))
+    {
+        if (q->count >= q->capacity)
+        {
+            q->capacity = (q->capacity == 0) ? 16 : q->capacity * 2;
+            file_task_t* tmp = (file_task_t*)realloc(q->tasks, q->capacity * sizeof(file_task_t));
+            if (!tmp) { fprintf(stderr, "Ошибка памяти при сборе файлов\n"); return; }
+            q->tasks = tmp;
+        }
+        // Лимит 4GB: file_size хранится в uint32_t (4 байта в заголовке образа)
+        if (st.st_size > (off_t)0xFFFFFFFF)
+        {
+            fprintf(stderr, "Ошибка: файл '%s' превышает 4GB (%ld байт)\n",
+                    base_image, (long)st.st_size);
+            return;
+        }
+        strncpy(q->tasks[q->count].real_path, base_real, MAX_PATH_LEN - 1);
+        q->tasks[q->count].real_path[MAX_PATH_LEN - 1] = '\0';
+        strncpy(q->tasks[q->count].image_path, base_image, MAX_PATH_LEN - 1);
+        q->tasks[q->count].image_path[MAX_PATH_LEN - 1] = '\0';
+        q->tasks[q->count].file_size = (uint32_t)st.st_size;
+        q->tasks[q->count].image_offset = 0;
+        q->count++;
+    }
 }
 
-int process_one_file(const char* input_file, const char* output_file)
+// Шифрование файла: ОДНА соль, ОДИН непрерывный RC4-поток на весь файл
+// Формат записи: [4B file_size][4B name_len][16B salt][name][encrypted_data]
+// Все числовые поля записываются в little-endian (write_le32)
+int process_file_to_image(const char* input_file, int image_fd,
+                           const char* internal_name, off_t offset, uint32_t known_size)
 {
     FILE* in = fopen(input_file, "rb");
-    if (!in)
-    {
-        fprintf(stderr, "Input file error [%s]: %s\n", input_file, strerror(errno));
-        return 1;
-    }
+    if (!in) return 1;
 
-    FILE* out = fopen(output_file, "wb");
-    if (!out)
+    uint32_t name_len = (uint32_t)strlen(internal_name);
+
+    // Валидация имени
+    if (name_len == 0 || name_len > MAX_NAME_LEN)
     {
-        fprintf(stderr, "Output file error [%s]: %s\n", output_file, strerror(errno));
+        fprintf(stderr, "Ошибка: недопустимая длина имени файла (%u): '%s'\n",
+                name_len, internal_name);
         fclose(in);
         return 1;
     }
 
-    unsigned char read_buf[BUFFER_SIZE];
-    unsigned char enc_buf[BUFFER_SIZE];
+    uint32_t file_size = known_size;
 
-    while (keep_running)
+    // Генерируем ОДНУ соль для всего файла
+    unsigned char salt[16];
+    generate_salt(salt);
+
+    // Записываем заголовок: [4B file_size][4B name_len][16B salt][name] (LE32)
+    int header_size = 4 + 4 + 16 + (int)name_len;
+    unsigned char* header = (unsigned char*)malloc(header_size);
+    if (!header) { fclose(in); return 1; }
+
+    write_le32(header, file_size);
+    write_le32(header + 4, name_len);
+    memcpy(header + 8, salt, 16);
+    memcpy(header + 24, internal_name, name_len);
+
+    ssize_t pw_ret = pwrite(image_fd, header, header_size, offset);
+    free(header);
+
+    if (pw_ret != header_size)
     {
-        size_t bytes = fread(read_buf, 1, BUFFER_SIZE, in);
-
-        if (bytes > 0)
-        {
-            caesar(read_buf, enc_buf, (int)bytes);
-
-            if (fwrite(enc_buf, 1, bytes, out) != bytes)
-            {
-                fprintf(stderr, "Write error [%s]\n", output_file);
-                fclose(in);
-                fclose(out);
-                return 1;
-            }
-        }
-
-        if (bytes < BUFFER_SIZE)
-        {
-            if (feof(in))
-                break;
-
-            if (ferror(in))
-            {
-                fprintf(stderr, "Read error [%s]\n", input_file);
-                fclose(in);
-                fclose(out);
-                return 1;
-            }
-        }
+        fprintf(stderr, "Ошибка: не удалось записать заголовок для '%s' (pwrite вернул %zd, ожидалось %d)\n",
+                internal_name, pw_ret, header_size);
+        fclose(in);
+        return 1;
     }
 
+    // Для пустого файла — не инициализируем криптографию (нечего шифровать)
+    if (file_size == 0)
+    {
+        fclose(in);
+        return 0;
+    }
+
+    // Инициализируем RC4 ОДИН РАЗ для всего файла (KSA с key = пароль||соль)
+    if (init_file_crypto(salt) != 0)
+    {
+        fprintf(stderr, "Ошибка: не удалось инициализировать шифрование для '%s'\n", internal_name);
+        fclose(in);
+        return 1;
+    }
+
+    // Шифруем данные чанками — один непрерывный RC4-поток
+    // Чанки — только I/O буфер, криптографически это один поток
+    off_t pos = offset + header_size;
+    unsigned char* read_buf = (unsigned char*)malloc(BUFFER_SIZE);
+    unsigned char* enc_buf = (unsigned char*)malloc(BUFFER_SIZE);
+    if (!read_buf || !enc_buf)
+    {
+        fprintf(stderr, "Ошибка выделения памяти при шифровании\n");
+        free(read_buf); free(enc_buf);
+        fclose(in);
+        end_file_crypto();
+        return 1;
+    }
+
+    uint32_t remaining = file_size;
+    int error = 0;
+
+    while (remaining > 0 && !error)
+    {
+        uint32_t this_chunk = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
+        size_t bytes = fread(read_buf, 1, this_chunk, in);
+
+        if (bytes != this_chunk) { error = 1; break; }
+
+        // rc4_crypt теперь возвращает int — проверяем ошибку шифрования
+        if (rc4_crypt(read_buf, enc_buf, (int)bytes) != 0)
+        {
+            fprintf(stderr, "Ошибка шифрования чанка для '%s'\n", internal_name);
+            error = 1;
+            break;
+        }
+
+        pw_ret = pwrite(image_fd, enc_buf, bytes, pos);
+        if (pw_ret != (ssize_t)bytes)
+        {
+            fprintf(stderr, "Ошибка: pwrite для '%s' вернул %zd, ожидалось %u\n",
+                    internal_name, pw_ret, this_chunk);
+            error = 1;
+            break;
+        }
+        pos += bytes;
+        remaining -= bytes;
+    }
+
+    // Уничтожаем S-box один раз после обработки всего файла
+    end_file_crypto();
+
+    // Затираем буферы перед освобождением
+    explicit_bzero(read_buf, BUFFER_SIZE);
+    explicit_bzero(enc_buf, BUFFER_SIZE);
+
+    free(read_buf);
+    free(enc_buf);
     fclose(in);
-    fclose(out);
-
-    if (!keep_running)
-        return 2;
-
-    return 0;
+    return error;
 }
 
-void process_task(file_task_t* task)
-{
-    struct timespec start_time;
-    struct timespec end_time;
-
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    task->status = process_one_file(task->input_path, task->output_path);
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-
-    task->duration_ms = diff_ms(start_time, end_time);
-}
-
+// Воркер: берёт задачу через __atomic_fetch_add, пишет через pwrite — без мьютексов
 void* worker_thread(void* arg)
 {
-    worker_args_t* args = (worker_args_t*)arg;
-    task_queue_t* queue = args->queue;
+    task_queue_t* q = (task_queue_t*)arg;
 
-    while (keep_running)
+    while (1)
     {
-        pthread_mutex_lock(&queue->mutex);
+        int idx = __atomic_fetch_add(&q->next_index, 1, __ATOMIC_SEQ_CST);
+        if (idx >= q->count) break;
 
-        while (!queue->started && keep_running)
-            pthread_cond_wait(&queue->cond, &queue->mutex);
+        file_task_t* task = &q->tasks[idx];
 
-        if (!keep_running)
+        if (process_file_to_image(task->real_path, q->image_fd,
+                                   task->image_path, task->image_offset,
+                                   task->file_size) == 0)
         {
-            pthread_mutex_unlock(&queue->mutex);
-            break;
+            printf("Добавлен: %s\n", task->image_path);
         }
-
-        if (queue->next_index >= queue->count)
+        else
         {
-            pthread_mutex_unlock(&queue->mutex);
-            break;
+            fprintf(stderr, "Ошибка обработки: %s\n", task->real_path);
         }
-
-        int index = queue->next_index;
-        queue->next_index++;
-
-        pthread_mutex_unlock(&queue->mutex);
-
-        process_task(&queue->tasks[index]);
     }
-
     return NULL;
 }
 
-void collect_stats(run_mode_t mode, file_task_t* tasks, int count, double total_ms, run_stats_t* stats)
+
+int compare_items(const void* a, const void* b)
 {
-    double sum_file_ms = 0.0;
-    int success = 0;
-
-    for (int i = 0; i < count; i++)
-    {
-        sum_file_ms += tasks[i].duration_ms;
-        if (tasks[i].status == 0)
-            success++;
-    }
-
-    stats->mode = mode;
-    stats->total_ms = total_ms;
-    stats->avg_ms = (count > 0) ? (sum_file_ms / count) : 0.0;
-    stats->processed_files = count;
-    stats->success_files = success;
+    return strcmp(((list_item_t*)a)->name, ((list_item_t*)b)->name);
 }
 
-void print_stats(const run_stats_t* stats, file_task_t* tasks, int count)
+// Список файлов в образе. Формат: [4B size][4B name_len][16B salt][name][encrypted_data]
+// Числовые поля читаются как little-endian (read_le32)
+void cmd_list(const char* image)
 {
-    printf("\n============================================================\n");
-    printf("РЕЖИМ: %s\n", mode_to_string(stats->mode));
-    printf("Общее время: %.3f ms\n", stats->total_ms);
-    printf("Среднее время на файл: %.3f ms\n", stats->avg_ms);
-    printf("Обработано файлов: %d\n", stats->processed_files);
-    printf("Успешно обработано: %d\n", stats->success_files);
-    printf("============================================================\n");
-
-    for (int i = 0; i < count; i++)
+    FILE* img = fopen(image, "rb");
+    if (!img)
     {
-        printf("[%2d] %s -> %s | %.3f ms | %s\n",
-               i + 1,
-               tasks[i].input_path,
-               tasks[i].output_path,
-               tasks[i].duration_ms,
-               (tasks[i].status == 0) ? "OK" : "ERROR");
+        fprintf(stderr, "Не удалось открыть образ: %s\n", image);
+        return;
     }
+
+    list_item_t* items = NULL;
+    int count = 0, capacity = 0;
+    unsigned char hdr_buf[8];   // file_size + name_len (LE32)
+    unsigned char salt[16];
+
+    while (fread(hdr_buf, 1, 8, img) == 8 &&
+           fread(salt, 1, 16, img) == 16)
+    {
+        uint32_t file_size = read_le32(hdr_buf);
+        uint32_t name_len = read_le32(hdr_buf + 4);
+
+        // Валидация: name_len должна быть > 0 и <= MAX_NAME_LEN
+        if (name_len == 0 || name_len > MAX_NAME_LEN)
+        {
+            fprintf(stderr, "Предупреждение: некорректная длина имени (%u), пропуск записи\n",
+                    name_len);
+            // Пропускаем данные: если name_len > MAX_NAME_LEN, считаем её для fseeko
+            if (fseeko(img, (off_t)name_len, SEEK_CUR) != 0) break;
+            if (file_size > 0 && fseeko(img, (off_t)file_size, SEEK_CUR) != 0) break;
+            continue;
+        }
+
+        if (count >= capacity)
+        {
+            capacity = (capacity == 0) ? 16 : capacity * 2;
+            items = (list_item_t*)realloc(items, capacity * sizeof(list_item_t));
+        }
+
+        if (fread(items[count].name, 1, name_len, img) != name_len) break;
+        items[count].name[name_len] = '\0';
+        items[count].size = file_size;
+        count++;
+
+        // Пропускаем зашифрованные данные (один непрерывный блок)
+        if (file_size > 0 && fseeko(img, (off_t)file_size, SEEK_CUR) != 0) break;
+    }
+    fclose(img);
+
+    if (count > 0)
+    {
+        // Дедупликация: оставляем последнюю версию при одинаковых именах
+        int* keep = (int*)calloc(count, sizeof(int));
+        for (int i = 0; i < count; i++) keep[i] = 1;
+        for (int i = 0; i < count; i++)
+        {
+            for (int j = i + 1; j < count; j++)
+            {
+                if (keep[i] && strcmp(items[i].name, items[j].name) == 0)
+                {
+                    keep[i] = 0;
+                    break;
+                }
+            }
+        }
+        int unique = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (keep[i])
+            {
+                if (unique != i) items[unique] = items[i];
+                unique++;
+            }
+        }
+        free(keep);
+        count = unique;
+
+        qsort(items, count, sizeof(list_item_t), compare_items);
+    }
+
+    printf("\nСодержимое образа '%s':\n", image);
+    printf("--------------------------------------------------\n");
+    for (int i = 0; i < count; i++)
+        printf("%-40s | %u байт\n", items[i].name, items[i].size);
+    printf("--------------------------------------------------\n");
+
+    free(items);
 }
 
-int run_sequential(file_task_t* tasks, int count, run_stats_t* stats)
+// Извлечение файла: ищем последнее вхождение, расшифровываем одним RC4-потоком
+// Числовые поля читаются как little-endian (read_le32)
+void cmd_get(const char* image, const char* out_file, const char* target)
 {
-    struct timespec start_time;
-    struct timespec end_time;
+    FILE* img = fopen(image, "rb");
+    if (!img)
+    {
+        fprintf(stderr, "Не удалось открыть образ: %s\n", image);
+        return;
+    }
 
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    unsigned char hdr_buf[8];
+    unsigned char salt[16];
+    char current_name[MAX_PATH_LEN];
 
-    for (int i = 0; i < count && keep_running; i++)
-        process_task(&tasks[i]);
+    off_t last_data_pos = -1;
+    uint32_t last_file_size = 0;
+    unsigned char last_salt[16];
 
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    while (fread(hdr_buf, 1, 8, img) == 8 &&
+           fread(salt, 1, 16, img) == 16)
+    {
+        uint32_t file_size = read_le32(hdr_buf);
+        uint32_t name_len = read_le32(hdr_buf + 4);
 
-    collect_stats(MODE_SEQUENTIAL, tasks, count, diff_ms(start_time, end_time), stats);
+        off_t name_pos = ftello(img);
+
+        // Валидация name_len
+        if (name_len == 0 || name_len > MAX_NAME_LEN)
+        {
+            if (fseeko(img, (off_t)name_len, SEEK_CUR) != 0) break;
+            if (file_size > 0 && fseeko(img, (off_t)file_size, SEEK_CUR) != 0) break;
+            continue;
+        }
+
+        if (fread(current_name, 1, name_len, img) != name_len) break;
+        current_name[name_len] = '\0';
+
+        if (strcmp(current_name, target) == 0)
+        {
+            last_data_pos = name_pos + name_len;
+            last_file_size = file_size;
+            memcpy(last_salt, salt, 16);
+        }
+
+        // Пропускаем зашифрованные данные
+        if (file_size > 0 && fseeko(img, (off_t)file_size, SEEK_CUR) != 0) break;
+    }
+
+    if (last_data_pos >= 0)
+    {
+        fseeko(img, last_data_pos, SEEK_SET);
+
+        FILE* out = fopen(out_file, "wb");
+        if (!out)
+        {
+            fprintf(stderr, "Ошибка создания файла вывода: %s\n", out_file);
+            fclose(img);
+            return;
+        }
+
+        // Пустой файл — просто создаём пустой выходной файл
+        if (last_file_size == 0)
+        {
+            fclose(out);
+            fclose(img);
+            printf("Файл '%s' успешно извлечен в '%s'\n", target, out_file);
+            return;
+        }
+
+        // Инициализируем RC4 ОДИН РАЗ — один непрерывный поток на весь файл
+        if (init_file_crypto(last_salt) != 0)
+        {
+            fprintf(stderr, "Ошибка: не удалось инициализировать расшифровку для '%s'\n", target);
+            fclose(out);
+            fclose(img);
+            return;
+        }
+
+        unsigned char* in_buf = (unsigned char*)malloc(BUFFER_SIZE);
+        unsigned char* out_buf = (unsigned char*)malloc(BUFFER_SIZE);
+        if (!in_buf || !out_buf)
+        {
+            fprintf(stderr, "Ошибка памяти при расшифровке\n");
+            free(in_buf); free(out_buf);
+            fclose(out); fclose(img);
+            end_file_crypto();
+            return;
+        }
+
+        uint32_t remaining = last_file_size;
+        int error = 0;
+        while (remaining > 0 && !error)
+        {
+            uint32_t this_chunk = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
+            size_t bytes_read = fread(in_buf, 1, this_chunk, img);
+            if (bytes_read != this_chunk)
+            {
+                fprintf(stderr, "Предупреждение: неполное чтение данных для '%s' (ожидалось %u, прочитано %zu)\n",
+                        target, this_chunk, bytes_read);
+                error = 1;
+                break;
+            }
+
+            // rc4_crypt теперь возвращает int — проверяем ошибку
+            if (rc4_crypt(in_buf, out_buf, (int)this_chunk) != 0)
+            {
+                fprintf(stderr, "Ошибка расшифровки чанка для '%s'\n", target);
+                error = 1;
+                break;
+            }
+
+            size_t written = fwrite(out_buf, 1, this_chunk, out);
+            if (written != this_chunk)
+            {
+                fprintf(stderr, "Ошибка: записано %zu из %u байт в '%s'\n",
+                        written, this_chunk, out_file);
+                error = 1;
+                break;
+            }
+            remaining -= this_chunk;
+        }
+
+        end_file_crypto();  // уничтожаем S-box один раз после всех чанков
+
+        // Затираем буферы перед освобождением
+        explicit_bzero(in_buf, BUFFER_SIZE);
+        explicit_bzero(out_buf, BUFFER_SIZE);
+
+        free(in_buf);
+        free(out_buf);
+        fclose(out);
+        fclose(img);
+
+        if (!error)
+            printf("Файл '%s' успешно извлечен в '%s'\n", target, out_file);
+        return;
+    }
+
+    fprintf(stderr, "Файл '%s' не найден в образе.\n", target);
+    fclose(img);
+}
+
+// Проверка, начинается ли строка с указанного префикса флага
+// Поддерживает и -key и --key
+static int is_flag(const char* arg, const char* name)
+{
+    if (strcmp(arg, name) == 0) return 1;
+    // Проверяем двойное тире: --key == -key
+    if (arg[0] == '-' && arg[1] == '-' && strcmp(arg + 2, name + 1) == 0) return 1;
     return 0;
-}
-
-int run_parallel(file_task_t* tasks, int count, run_stats_t* stats)
-{
-    struct timespec start_time;
-    struct timespec end_time;
-
-    pthread_t workers[WORKERS_COUNT];
-    worker_args_t worker_args;
-    task_queue_t queue;
-
-    queue.tasks = tasks;
-    queue.count = count;
-    queue.next_index = 0;
-    queue.started = 0;
-
-    pthread_mutex_init(&queue.mutex, NULL);
-    pthread_cond_init(&queue.cond, NULL);
-
-    worker_args.queue = &queue;
-
-    int workers_to_create = (count < WORKERS_COUNT) ? count : WORKERS_COUNT;
-
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
-    for (int i = 0; i < workers_to_create; i++)
-        pthread_create(&workers[i], NULL, worker_thread, &worker_args);
-
-    pthread_mutex_lock(&queue.mutex);
-    queue.started = 1;
-    pthread_cond_broadcast(&queue.cond);
-    pthread_mutex_unlock(&queue.mutex);
-
-    for (int i = 0; i < workers_to_create; i++)
-        pthread_join(workers[i], NULL);
-
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-
-    pthread_mutex_destroy(&queue.mutex);
-    pthread_cond_destroy(&queue.cond);
-
-    collect_stats(MODE_PARALLEL, tasks, count, diff_ms(start_time, end_time), stats);
-    return 0;
-}
-
-void build_output_name(const char* input, const char* suffix, char* output, size_t output_size)
-{
-    snprintf(output, output_size, "%s%s", input, suffix);
-}
-
-file_task_t* create_tasks(char* input_files[], int count, const char* suffix)
-{
-    file_task_t* tasks = (file_task_t*)calloc((size_t)count, sizeof(file_task_t));
-    if (!tasks)
-        return NULL;
-
-    for (int i = 0; i < count; i++)
-    {
-        tasks[i].input_path = input_files[i];
-        build_output_name(input_files[i], suffix, tasks[i].output_path, sizeof(tasks[i].output_path));
-        tasks[i].duration_ms = 0.0;
-        tasks[i].status = -1;
-    }
-
-    return tasks;
-}
-
-void remove_generated_files(file_task_t* tasks, int count)
-{
-    for (int i = 0; i < count; i++)
-        remove(tasks[i].output_path);
-}
-
-int parse_mode(const char* arg, run_mode_t* mode)
-{
-    if (strcmp(arg, "--mode=sequential") == 0)
-    {
-        *mode = MODE_SEQUENTIAL;
-        return 0;
-    }
-
-    if (strcmp(arg, "--mode=parallel") == 0)
-    {
-        *mode = MODE_PARALLEL;
-        return 0;
-    }
-
-    if (strcmp(arg, "--mode=auto") == 0)
-    {
-        *mode = MODE_AUTO;
-        return 0;
-    }
-
-    return 1;
-}
-
-void print_usage(const char* prog_name)
-{
-    printf("Старый режим совместимости:\n");
-    printf("  %s input output key\n\n", prog_name);
-
-    printf("Новый режим:\n");
-    printf("  %s --mode=sequential --key=42 file1 file2 file3\n", prog_name);
-    printf("  %s --mode=parallel   --key=42 file1 file2 file3 file4 file5\n", prog_name);
-    printf("  %s --mode=auto       --key=42 file1 file2 file3 ...\n", prog_name);
-    printf("\n");
-    printf("В новом режиме выходные файлы создаются автоматически:\n");
-    printf("  file1 -> file1.enc\n");
-    printf("  file2 -> file2.enc\n");
-}
-
-int run_old_compatibility_mode(char* input_file, char* output_file, int key)
-{
-    struct timespec start_time;
-    struct timespec end_time;
-
-    set_key((char)key);
-
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    int status = process_one_file(input_file, output_file);
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-
-    printf("\n============================================================\n");
-    printf("РЕЖИМ СОВМЕСТИМОСТИ (старый интерфейс)\n");
-    printf("Файл: %s -> %s\n", input_file, output_file);
-    printf("Время: %.3f ms\n", diff_ms(start_time, end_time));
-    printf("Статус: %s\n", (status == 0) ? "OK" : "ERROR");
-    printf("============================================================\n");
-
-    if (!keep_running)
-        printf("Операция прервана пользователем\n");
-
-    return status;
 }
 
 int main(int argc, char* argv[])
 {
-    signal(SIGINT, sigint_handler);
+    int is_add = 0, is_list = 0, is_get = 0;
+    char *key = NULL, *image = NULL, *out_file = NULL, *target = NULL;
+    // Позиционные аргументы для -get (out_file и target могут быть без флага -out)
+    char *get_positional[2] = {NULL, NULL};
+    int get_pos_count = 0;
 
-    int test_violation = 0;
-
-    if (argc == 4 &&
-        strncmp(argv[1], "--mode=", 7) != 0 &&
-        strncmp(argv[1], "--key=", 6) != 0)
-    {
-        int key = atoi(argv[3]);
-        return run_old_compatibility_mode(argv[1], argv[2], key);
-    }
-
-    if (argc < 4)
-    {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    run_mode_t mode = MODE_AUTO;
-    int key = 0;
-    int key_set = 0;
-    int first_input_index = -1;
+    char **inputs = NULL;
+    int inputs_count = 0;
 
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "--test-violation") == 0)
+        if (is_flag(argv[i], "-add")) is_add = 1;
+        else if (is_flag(argv[i], "-list")) is_list = 1;
+        else if (is_flag(argv[i], "-get")) is_get = 1;
+        else if (is_flag(argv[i], "-key") && i + 1 < argc) key = argv[++i];
+        else if (is_flag(argv[i], "-image") && i + 1 < argc) image = argv[++i];
+        else if (is_flag(argv[i], "-out") && i + 1 < argc) out_file = argv[++i];
+        else
         {
-            test_violation = 1;
-        }
-        else if (strncmp(argv[i], "--mode=", 7) == 0)
-        {
-            if (parse_mode(argv[i], &mode) != 0)
+            if (is_add)
             {
-                fprintf(stderr, "Unknown mode: %s\n", argv[i]);
-                return 1;
+                if (!inputs) inputs = (char**)malloc(argc * sizeof(char*));
+                inputs[inputs_count++] = argv[i];
+            }
+            else if (is_get)
+            {
+                // Собираем позиционные аргументы для -get
+                if (get_pos_count < 2)
+                    get_positional[get_pos_count++] = argv[i];
             }
         }
-        else if (strncmp(argv[i], "--key=", 6) == 0)
+    }
+
+    // Для -get: если -out не указан, первый позиционный = out_file, второй = target
+    // Если -out указан, первый позиционный = target
+    if (is_get)
+    {
+        if (!out_file && get_pos_count >= 2)
         {
-            key = atoi(argv[i] + 6);
-            key_set = 1;
+            out_file = get_positional[0];
+            target = get_positional[1];
         }
-        else if (first_input_index == -1)
+        else if (out_file && !target && get_pos_count >= 1)
         {
-            first_input_index = i;
+            target = get_positional[0];
         }
-    }
-
-    if (!key_set || first_input_index == -1)
-    {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    int files_count = argc - first_input_index;
-    char** input_files = &argv[first_input_index];
-
-    if (files_count <= 0)
-    {
-        fprintf(stderr, "No input files provided\n");
-        return 1;
-    }
-
-    set_key((char)key);
-
-    if (test_violation)
-    {
-        printf(">>> Инициируем попытку несанкционированной записи в защищенную память...\n");
-        test_security_violation();
-    }
-
-    if (mode == MODE_SEQUENTIAL || mode == MODE_PARALLEL)
-    {
-        file_task_t* tasks = create_tasks(input_files, files_count, ".enc");
-        if (!tasks)
+        else if (!out_file && get_pos_count == 1)
         {
-            fprintf(stderr, "Memory allocation error\n");
-            cleanup_key();
-            return 1;
+            // Только один позиционный — это target, out_file не указан
+            target = get_positional[0];
+        }
+    }
+
+    if (is_add && key && image && inputs_count > 0)
+    {
+        set_key(key);
+
+        task_queue_t q;
+        memset(&q, 0, sizeof(q));
+        q.image_name = image;
+
+        // Собираем файлы + получаем размеры через stat()
+        for (int i = 0; i < inputs_count; i++)
+        {
+            struct stat st;
+            if (stat(inputs[i], &st) == 0 && S_ISDIR(st.st_mode))
+                collect_files(&q, inputs[i], "");
+            else
+            {
+                // Для одиночного файла — используем basename как путь в образе
+                char* tmp = strdup(inputs[i]);
+                char* bname = basename(tmp);
+                collect_files(&q, inputs[i], bname);
+                free(tmp);
+            }
         }
 
-        run_stats_t stats;
+        if (q.count > 0)
+        {
+            // Предрасчёт смещений: [4B file_size][4B name_len][16B salt][name][encrypted_data]
+            off_t current_offset = 0;
 
-        if (mode == MODE_SEQUENTIAL)
-            run_sequential(tasks, files_count, &stats);
-        else
-            run_parallel(tasks, files_count, &stats);
+            struct stat img_st;
+            if (stat(image, &img_st) == 0 && img_st.st_size > 0)
+                current_offset = img_st.st_size;
 
-        print_stats(&stats, tasks, files_count);
-        free(tasks);
+            q.original_size = current_offset;
+
+            for (int i = 0; i < q.count; i++)
+            {
+                q.tasks[i].image_offset = current_offset;
+                uint32_t name_len = (uint32_t)strlen(q.tasks[i].image_path);
+                off_t record_size = 4 + 4 + 16 + (off_t)name_len + (off_t)q.tasks[i].file_size;
+                current_offset += record_size;
+            }
+
+            // Создаём/открываем образ для записи
+            q.image_fd = open(image, O_RDWR | O_CREAT, 0644);
+            if (q.image_fd < 0)
+            {
+                fprintf(stderr, "Не удалось создать образ: %s\n", image);
+                free(q.tasks);
+                free(inputs);
+                cleanup_key();
+                return 1;
+            }
+
+            if (ftruncate(q.image_fd, current_offset) != 0)
+            {
+                fprintf(stderr, "Ошибка: ftruncate не смог выделить место для образа (%s)\n",
+                        strerror(errno));
+                close(q.image_fd);
+                free(q.tasks);
+                free(inputs);
+                cleanup_key();
+                return 1;
+            }
+
+            // Запускаем потоки — всегда параллельно, без мьютексов на запись
+            int t_count = (q.count < MAX_WORKERS) ? q.count : MAX_WORKERS;
+            pthread_t threads[MAX_WORKERS];
+
+            for (int i = 0; i < t_count; i++)
+                pthread_create(&threads[i], NULL, worker_thread, &q);
+
+            for (int i = 0; i < t_count; i++)
+                pthread_join(threads[i], NULL);
+
+            close(q.image_fd);
+            free(q.tasks);
+        }
+
+        free(inputs);
+        cleanup_key();
+    }
+    else if (is_list && image)
+    {
+        cmd_list(image);
+        free(inputs);  // на случай если были собраны
+    }
+    else if (is_get && key && image && out_file && target)
+    {
+        set_key(key);
+        cmd_get(image, out_file, target);
+        cleanup_key();
+        free(inputs);
     }
     else
     {
-        run_mode_t chosen_mode = choose_auto_mode(files_count);
-        run_mode_t alt_mode =
-            (chosen_mode == MODE_SEQUENTIAL) ? MODE_PARALLEL : MODE_SEQUENTIAL;
-
-        file_task_t* chosen_tasks = create_tasks(input_files, files_count, ".enc");
-        file_task_t* alt_tasks = create_tasks(input_files, files_count, ".bench.enc");
-
-        if (!chosen_tasks || !alt_tasks)
-        {
-            fprintf(stderr, "Memory allocation error\n");
-            free(chosen_tasks);
-            free(alt_tasks);
-            cleanup_key();
-            return 1;
-        }
-
-        run_stats_t chosen_stats;
-        run_stats_t alt_stats;
-
-        printf("AUTO MODE: файлов = %d, выбран режим = %s\n",
-               files_count, mode_to_string(chosen_mode));
-
-        if (chosen_mode == MODE_SEQUENTIAL)
-            run_sequential(chosen_tasks, files_count, &chosen_stats);
-        else
-            run_parallel(chosen_tasks, files_count, &chosen_stats);
-
-        if (alt_mode == MODE_SEQUENTIAL)
-            run_sequential(alt_tasks, files_count, &alt_stats);
-        else
-            run_parallel(alt_tasks, files_count, &alt_stats);
-
-        print_stats(&chosen_stats, chosen_tasks, files_count);
-
-        printf("\n================ СРАВНЕНИЕ РЕЖИМОВ ================\n");
-        printf("%-12s | %-12s | %-18s | %-10s\n",
-               "Режим", "Общее (ms)", "Среднее/файл (ms)", "Файлов");
-        printf("---------------------------------------------------\n");
-        printf("%-12s | %-12.3f | %-18.3f | %-10d\n",
-               mode_to_string(chosen_stats.mode),
-               chosen_stats.total_ms,
-               chosen_stats.avg_ms,
-               chosen_stats.processed_files);
-        printf("%-12s | %-12.3f | %-18.3f | %-10d\n",
-               mode_to_string(alt_stats.mode),
-               alt_stats.total_ms,
-               alt_stats.avg_ms,
-               alt_stats.processed_files);
-        printf("===================================================\n");
-
-        remove_generated_files(alt_tasks, files_count);
-
-        free(chosen_tasks);
-        free(alt_tasks);
+        fprintf(stderr, "Ошибка: неверные аргументы\n");
+        printf("Использование:\n");
+        printf("  ./secure_copy -add -key <key> -image <img.img> <file1|dir1> ...\n");
+        printf("  ./secure_copy -list -image <img.img>\n");
+        printf("  ./secure_copy -get -image <img.img> -key <key> -out <result> <filename>\n");
+        printf("  ./secure_copy -get -image <img.img> -key <key> <result> <filename>\n");
+        printf("\nПоддерживаются флаги с одним тире (-key) и двумя (--key).\n");
+        free(inputs);
+        return 1;
     }
-
-    if (!keep_running)
-        printf("Операция прервана пользователем\n");
-
-    cleanup_key();
 
     return 0;
 }
